@@ -8,7 +8,7 @@ Desktop automation tool to simulate multiple Google Meet participants from one m
 - Launch multiple participants from one computer
 - Use one incognito Chrome session per participant
 - Enter custom participant names
-- Auto-generate missing names (`User_#`)
+- Enforce one name per participant (line-by-line validation)
 - Keep camera off (shortcut automation)
 - Keep mic off (shortcut automation)
 - Auto click `Ask to join` / `Join now`
@@ -27,8 +27,12 @@ Desktop automation tool to simulate multiple Google Meet participants from one m
 
 ```text
 .
+├── .github/workflows/build-desktop.yml
 ├── main.py
+├── requirements-packaging.txt
 ├── requirements.txt
+├── scripts/build_macos.sh
+├── scripts/build_windows.ps1
 ├── .gitignore
 └── README.md
 ```
@@ -75,6 +79,49 @@ pip install -r requirements.txt
 python main.py
 ```
 
+## Build Desktop Apps (macOS and Windows)
+
+This project uses PyInstaller to create distributable desktop builds.
+
+### Local build on macOS
+
+```bash
+chmod +x scripts/build_macos.sh
+./scripts/build_macos.sh
+```
+
+Expected output:
+
+- `dist/MultiUserGoogleMeetJoiner.app`
+
+### Local build on Windows
+
+Run in PowerShell:
+
+```powershell
+./scripts/build_windows.ps1
+```
+
+Expected output:
+
+- `dist\MultiUserGoogleMeetJoiner\MultiUserGoogleMeetJoiner.exe`
+
+### Automated builds (GitHub Actions)
+
+Workflow file:
+
+- `.github/workflows/build-desktop.yml`
+
+How to trigger:
+
+1. Push a tag like `v1.0.0`, or
+2. Run `Build Desktop Apps` manually from the Actions tab.
+
+Artifacts produced:
+
+- `MultiUserGoogleMeetJoiner-macos.zip`
+- `MultiUserGoogleMeetJoiner-windows.zip`
+
 ## Usage
 
 1. Enter a valid Meet link, for example:
@@ -94,6 +141,10 @@ python main.py
 	 - `Keep Mic OFF`
 	 - `Auto Join`
 	 - `Mute Participant Sound After Join`
+	 - `Execution Speed`:
+	   - `Fast` (default)
+	   - `Balanced`
+	   - `Reliable`
 	 - `Pre-Join Popup Action`:
 	   - `Continue without microphone and camera`
 	   - `Use microphone and camera`
@@ -108,6 +159,8 @@ python main.py
 - Participants can launch in separate incognito windows or as tabs in one shared incognito window.
 - For same-window mode, you can choose post-join display mode (`No change`, `Expanded window`, `Full screen`).
 - Retry logic is used when key Meet elements are not found.
+- Join timing and retry behavior are configurable via `Execution Speed` profile.
+- `Fast` mode minimizes waits and retries for speed; use `Balanced` or `Reliable` for unstable UI/network.
 - Pre-join media popup handling is configurable from the UI before launch.
 - In `Continue without microphone and camera` mode, the app skips extra device-toggle verification to reduce join delay.
 - Participant speaker output can be muted so admitted users stay silent.

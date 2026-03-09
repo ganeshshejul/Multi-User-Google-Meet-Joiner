@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import queue
 import re
+import os
 import sys
 import threading
 import time
@@ -32,12 +33,12 @@ from selenium.common.exceptions import (
     TimeoutException,
     WebDriverException,
 )
+from selenium.webdriver.chrome.options import Options as ChromeOptions
 from selenium.webdriver.chrome.service import Service as ChromeService
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.remote.webdriver import WebDriver
 from selenium.webdriver.remote.webelement import WebElement
-from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 from webdriver_manager.chrome import ChromeDriverManager
 
@@ -50,6 +51,9 @@ LAUNCH_MODE_SAME_WINDOW_TABS = "same_window_tabs"
 SAME_WINDOW_VIEW_NONE = "none"
 SAME_WINDOW_VIEW_EXPANDED = "expanded"
 SAME_WINDOW_VIEW_FULLSCREEN = "fullscreen"
+EXECUTION_SPEED_FAST = "fast"
+EXECUTION_SPEED_BALANCED = "balanced"
+EXECUTION_SPEED_RELIABLE = "reliable"
 
 MEDIA_PROMPT_LABEL_TO_VALUE = {
     "Continue without microphone and camera": MEDIA_PROMPT_ACTION_CONTINUE,
@@ -80,6 +84,16 @@ SAME_WINDOW_VIEW_VALUE_TO_LABEL = {
     value: label for label, value in SAME_WINDOW_VIEW_LABEL_TO_VALUE.items()
 }
 
+EXECUTION_SPEED_LABEL_TO_VALUE = {
+    "Fast": EXECUTION_SPEED_FAST,
+    "Balanced": EXECUTION_SPEED_BALANCED,
+    "Reliable": EXECUTION_SPEED_RELIABLE,
+}
+
+EXECUTION_SPEED_VALUE_TO_LABEL = {
+    value: label for label, value in EXECUTION_SPEED_LABEL_TO_VALUE.items()
+}
+
 MEET_URL_PATTERN = re.compile(
     r"^https://meet\.google\.com/[a-z]{3}-[a-z]{4}-[a-z]{3}(?:[/?].*)?$", re.IGNORECASE
 )
@@ -96,10 +110,12 @@ class JoinConfig:
     keep_mic_off: bool
     auto_join: bool
     mute_participant_sound: bool = True
+    execution_speed_profile: str = EXECUTION_SPEED_FAST
     media_prompt_action: str = MEDIA_PROMPT_ACTION_CONTINUE
     launch_delay_seconds: float = 0.8
     element_retry_attempts: int = 5
     element_retry_wait_seconds: float = 2.0
+    selector_lookup_timeout_seconds: float = 1.0
 
 
 def is_valid_meet_url(url: str) -> bool:
@@ -252,6 +268,8 @@ class MeetJoinController:
                 self._emit(
                     f"Process finished. Successful joins: {success_count}, Failed joins: {failed_count}"
                 )
+        except Exception as exc:  # pylint: disable=broad-except
+            self._emit(f"Fatal automation setup error: {exc}")
         finally:
             self._finished_callback()
 
@@ -326,12 +344,23 @@ class MeetJoinController:
                 self._emit("Could not apply fallback expanded window mode.")
 
     def _create_driver(self, config: JoinConfig) -> WebDriver:
-        options = webdriver.ChromeOptions()
+        options = ChromeOptions()
         options.add_argument("--incognito")
         options.add_argument("--window-size=1400,900")
         options.add_argument("--disable-notifications")
         options.add_argument("--disable-infobars")
         options.add_argument("--disable-blink-features=AutomationControlled")
+
+        # In packaged macOS apps, explicit Chrome binary discovery improves reliability.
+        chrome_candidates = (
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            os.path.expanduser("~/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+        )
+        for candidate in chrome_candidates:
+            if os.path.exists(candidate):
+                options.binary_location = candidate
+                break
+
         if config.mute_participant_sound:
             # Mute tab output audio so joined participants stay silent.
             options.add_argument("--mute-audio")
@@ -354,12 +383,30 @@ class MeetJoinController:
         }
         options.add_experimental_option("prefs", prefs)
 
-        if self._chromedriver_path is None:
-            self._emit("Resolving ChromeDriver (first launch may take a moment)...")
-            self._chromedriver_path = ChromeDriverManager().install()
+        selenium_manager_error: Optional[Exception] = None
+        try:
+            self._emit("Starting Chrome via Selenium Manager...")
+            return webdriver.Chrome(options=options)
+        except Exception as exc:  # pylint: disable=broad-except
+            selenium_manager_error = exc
+            self._emit(f"Selenium Manager startup failed, trying fallback driver: {exc}")
 
-        service = ChromeService(executable_path=self._chromedriver_path)
-        return webdriver.Chrome(service=service, options=options)
+        webdriver_manager_error: Optional[Exception] = None
+        try:
+            if self._chromedriver_path is None:
+                self._emit("Resolving ChromeDriver with webdriver-manager...")
+                self._chromedriver_path = ChromeDriverManager().install()
+
+            service = ChromeService(executable_path=self._chromedriver_path)
+            return webdriver.Chrome(service=service, options=options)
+        except Exception as exc:  # pylint: disable=broad-except
+            webdriver_manager_error = exc
+
+        raise RuntimeError(
+            "Could not start Chrome WebDriver. "
+            f"Selenium Manager error: {selenium_manager_error}; "
+            f"webdriver-manager error: {webdriver_manager_error}"
+        )
 
     def _join_single(self, driver: WebDriver, config: JoinConfig, participant_name: str) -> bool:
         driver.get(config.meeting_url)
@@ -378,7 +425,7 @@ class MeetJoinController:
         media_prompt_handled = self._handle_prejoin_media_prompt(driver, config) or media_prompt_handled
         if config.media_prompt_action == MEDIA_PROMPT_ACTION_USE:
             # Recheck once because this prompt can render a moment after page load.
-            time.sleep(0.4)
+            time.sleep(0.15 if config.execution_speed_profile == EXECUTION_SPEED_FAST else 0.4)
             media_prompt_handled = (
                 self._handle_prejoin_media_prompt(driver, config) or media_prompt_handled
             )
@@ -429,11 +476,13 @@ class MeetJoinController:
             (By.XPATH, "//button[contains(normalize-space(), 'Join now')]"),
         )
 
+        lookup_timeout = max(0.15, config.selector_lookup_timeout_seconds)
+
         for attempt in range(1, config.element_retry_attempts + 1):
             if self._stop_event.is_set():
                 return
 
-            if self._find_first_present(driver, selectors, timeout_seconds=1) is not None:
+            if self._find_first_present(driver, selectors, timeout_seconds=lookup_timeout) is not None:
                 return
 
             self._emit(f"Waiting for Meet pre-join UI (attempt {attempt}/{config.element_retry_attempts}).")
@@ -465,6 +514,7 @@ class MeetJoinController:
             selectors,
             attempts=config.element_retry_attempts,
             wait_between_attempts=config.element_retry_wait_seconds,
+            timeout_seconds=max(0.15, config.selector_lookup_timeout_seconds),
         )
 
         if name_input is None:
@@ -572,20 +622,24 @@ class MeetJoinController:
             if self._stop_event.is_set():
                 return False
 
-            prompt_button = self._find_first_clickable(driver, selectors, timeout_seconds=1)
+            prompt_button = self._find_first_clickable(
+                driver,
+                selectors,
+                timeout_seconds=max(0.15, config.selector_lookup_timeout_seconds),
+            )
             if prompt_button is None:
                 return False
 
             try:
                 prompt_button.click()
                 self._emit(f"Handled media popup using '{action_label}'.")
-                time.sleep(0.5)
+                time.sleep(0.2)
                 return True
             except (ElementClickInterceptedException, StaleElementReferenceException):
                 try:
                     driver.execute_script("arguments[0].click();", prompt_button)
                     self._emit(f"Handled media popup via script click ('{action_label}').")
-                    time.sleep(0.5)
+                    time.sleep(0.2)
                     return True
                 except WebDriverException:
                     self._emit(
@@ -605,11 +659,13 @@ class MeetJoinController:
         )
 
         dismissed = False
-        for attempt in range(1, config.element_retry_attempts + 1):
+        max_attempts = 1 if config.execution_speed_profile == EXECUTION_SPEED_FAST else config.element_retry_attempts
+        tip_timeout = max(0.12, config.selector_lookup_timeout_seconds * 0.6)
+        for attempt in range(1, max_attempts + 1):
             if self._stop_event.is_set():
                 return dismissed
 
-            tip_button = self._find_first_present(driver, selectors, timeout_seconds=0.8)
+            tip_button = self._find_first_present(driver, selectors, timeout_seconds=tip_timeout)
             if tip_button is None:
                 return dismissed
 
@@ -617,24 +673,25 @@ class MeetJoinController:
                 tip_button.click()
                 dismissed = True
                 self._emit("Dismissed Meet tip popup.")
-                time.sleep(0.2)
+                time.sleep(0.1)
                 continue
             except (ElementClickInterceptedException, StaleElementReferenceException):
                 try:
                     driver.execute_script("arguments[0].click();", tip_button)
                     dismissed = True
                     self._emit("Dismissed Meet tip popup via script click.")
-                    time.sleep(0.2)
+                    time.sleep(0.1)
                     continue
                 except WebDriverException:
                     self._emit(
                         f"Meet tip dismissal retry needed (attempt {attempt}/{config.element_retry_attempts})."
                     )
-                    time.sleep(0.5)
+                    time.sleep(0.2)
 
         return dismissed
 
     def _ensure_device_off(self, driver: WebDriver, device_label: str, config: JoinConfig) -> bool:
+        fast_mode = config.execution_speed_profile == EXECUTION_SPEED_FAST
         if device_label == "camera":
             on_selectors: Sequence[Selector] = (
                 (
@@ -680,18 +737,32 @@ class MeetJoinController:
             )
             shortcut_key = "d"
 
-        for attempt in range(1, config.element_retry_attempts + 1):
+        toggle_timeout = max(0.12, config.selector_lookup_timeout_seconds)
+        confirm_timeout = 0.2 if fast_mode else 0.7
+        max_attempts = 1 if fast_mode else config.element_retry_attempts
+
+        for attempt in range(1, max_attempts + 1):
             if self._stop_event.is_set():
                 return False
 
             # If the OFF-state button is already present, nothing to do.
-            already_off = self._find_first_present(driver, off_selectors, timeout_seconds=0.8)
+            already_off = self._find_first_present(driver, off_selectors, timeout_seconds=toggle_timeout)
             if already_off is not None:
                 self._emit(f"{device_label.capitalize()} already OFF.")
                 return True
 
-            should_turn_off = self._find_first_clickable(driver, on_selectors, timeout_seconds=0.8)
+            should_turn_off = self._find_first_clickable(
+                driver,
+                on_selectors,
+                timeout_seconds=toggle_timeout,
+            )
             if should_turn_off is None:
+                if fast_mode:
+                    self._emit(
+                        f"Fast mode: could not read {device_label} state quickly, using shortcut fallback."
+                    )
+                    self._toggle_device_shortcut(driver, shortcut_key, device_label)
+                    return True
                 self._emit(
                     f"Could not read {device_label} toggle state (attempt {attempt}/{config.element_retry_attempts})."
                 )
@@ -712,8 +783,15 @@ class MeetJoinController:
                     time.sleep(config.element_retry_wait_seconds)
                     continue
 
-            time.sleep(0.4)
-            confirmed_off = self._find_first_present(driver, off_selectors, timeout_seconds=1)
+            if fast_mode:
+                return True
+
+            time.sleep(0.12)
+            confirmed_off = self._find_first_present(
+                driver,
+                off_selectors,
+                timeout_seconds=confirm_timeout,
+            )
             if confirmed_off is not None:
                 self._emit(f"Confirmed {device_label} is OFF before join.")
                 return True
@@ -722,8 +800,12 @@ class MeetJoinController:
             f"Could not reliably confirm {device_label} OFF from UI. Trying keyboard shortcut fallback."
         )
         self._toggle_device_shortcut(driver, shortcut_key, device_label)
-        time.sleep(0.4)
-        confirmed_off = self._find_first_present(driver, off_selectors, timeout_seconds=1)
+        time.sleep(0.12)
+        confirmed_off = self._find_first_present(
+            driver,
+            off_selectors,
+            timeout_seconds=confirm_timeout,
+        )
         if confirmed_off is not None:
             self._emit(f"Confirmed {device_label} is OFF after shortcut fallback.")
             return True
@@ -737,7 +819,7 @@ class MeetJoinController:
             body.click()
             body.send_keys(Keys.CONTROL, key_char)
             self._emit(f"Sent Ctrl+{key_char.upper()} to toggle {device_label}.")
-            time.sleep(0.3)
+            time.sleep(0.1)
             return
         except WebDriverException:
             pass
@@ -747,7 +829,7 @@ class MeetJoinController:
             body.click()
             body.send_keys(Keys.COMMAND, key_char)
             self._emit(f"Sent Cmd+{key_char.upper()} to toggle {device_label}.")
-            time.sleep(0.3)
+            time.sleep(0.1)
         except WebDriverException:
             self._emit(f"Failed to toggle {device_label} shortcut.")
 
@@ -771,7 +853,11 @@ class MeetJoinController:
             if self._stop_event.is_set():
                 return False
 
-            button = self._find_first_present(driver, selectors, timeout_seconds=2)
+            button = self._find_first_present(
+                driver,
+                selectors,
+                timeout_seconds=max(0.2, config.selector_lookup_timeout_seconds),
+            )
             if button is None:
                 self._emit(
                     f"Join button not found (attempt {attempt}/{config.element_retry_attempts})."
@@ -827,18 +913,20 @@ class MeetJoinController:
         selectors: Sequence[Selector],
         attempts: int,
         wait_between_attempts: float,
+        timeout_seconds: float,
     ):
         for attempt in range(1, attempts + 1):
             if self._stop_event.is_set():
                 return None
 
-            for by, value in selectors:
-                try:
-                    return WebDriverWait(driver, 2).until(
-                        EC.visibility_of_element_located((by, value))
-                    )
-                except TimeoutException:
-                    continue
+            visible_element = self._find_first_present(
+                driver,
+                selectors,
+                timeout_seconds=timeout_seconds,
+                require_visible=True,
+            )
+            if visible_element is not None:
+                return visible_element
 
             self._emit(f"Waiting for name field (attempt {attempt}/{attempts}).")
             time.sleep(wait_between_attempts)
@@ -851,28 +939,42 @@ class MeetJoinController:
         selectors: Sequence[Selector],
         timeout_seconds: float = 2,
     ):
-        for by, value in selectors:
-            try:
-                return WebDriverWait(driver, timeout_seconds).until(
-                    EC.element_to_be_clickable((by, value))
-                )
-            except TimeoutException:
-                continue
-        return None
+        return self._find_first_present(
+            driver,
+            selectors,
+            timeout_seconds=timeout_seconds,
+            require_clickable=True,
+        )
 
     def _find_first_present(
         self,
         driver: WebDriver,
         selectors: Sequence[Selector],
         timeout_seconds: float = 2,
+        require_visible: bool = False,
+        require_clickable: bool = False,
+        poll_interval_seconds: float = 0.05,
     ):
-        for by, value in selectors:
-            try:
-                return WebDriverWait(driver, timeout_seconds).until(
-                    EC.presence_of_element_located((by, value))
-                )
-            except TimeoutException:
-                continue
+        end_time = time.time() + timeout_seconds
+        while time.time() < end_time:
+            if self._stop_event.is_set():
+                return None
+
+            for by, value in selectors:
+                try:
+                    elements = driver.find_elements(by, value)
+                except WebDriverException:
+                    continue
+
+                for element in elements:
+                    if require_visible and not element.is_displayed():
+                        continue
+                    if require_clickable and (not element.is_displayed() or not element.is_enabled()):
+                        continue
+                    return element
+
+            time.sleep(poll_interval_seconds)
+
         return None
 
     def _register_driver(self, driver: WebDriver) -> None:
@@ -914,6 +1016,9 @@ class MultiMeetJoinerApp(tk.Tk):
         )
         self._same_window_post_join_view_label = tk.StringVar(
             value=SAME_WINDOW_VIEW_VALUE_TO_LABEL[SAME_WINDOW_VIEW_NONE]
+        )
+        self._execution_speed_label = tk.StringVar(
+            value=EXECUTION_SPEED_VALUE_TO_LABEL[EXECUTION_SPEED_FAST]
         )
         self._keep_camera_off = tk.BooleanVar(value=True)
         self._keep_mic_off = tk.BooleanVar(value=True)
@@ -1033,6 +1138,17 @@ class MultiMeetJoinerApp(tk.Tk):
             width=42,
         ).grid(row=2, column=1, columnspan=2, sticky="w", pady=(8, 0))
 
+        ttk.Label(options_frame, text="Execution Speed").grid(
+            row=3, column=0, sticky="w", pady=(8, 0)
+        )
+        ttk.Combobox(
+            options_frame,
+            textvariable=self._execution_speed_label,
+            values=list(EXECUTION_SPEED_LABEL_TO_VALUE.keys()),
+            state="readonly",
+            width=20,
+        ).grid(row=3, column=1, sticky="w", pady=(8, 0))
+
         controls = ttk.Frame(container)
         controls.grid(row=4, column=0, sticky="ew", pady=(0, 10))
 
@@ -1073,6 +1189,9 @@ class MultiMeetJoinerApp(tk.Tk):
                 "Post-join same-window view: "
                 f"{SAME_WINDOW_VIEW_VALUE_TO_LABEL[config.same_window_post_join_view]}"
             )
+        self._append_status(
+            f"Execution speed profile: {EXECUTION_SPEED_VALUE_TO_LABEL[config.execution_speed_profile]}"
+        )
         self._append_status(
             f"Pre-join popup action: {MEDIA_PROMPT_VALUE_TO_LABEL[config.media_prompt_action]}"
         )
@@ -1167,6 +1286,27 @@ class MultiMeetJoinerApp(tk.Tk):
         )
         if launch_mode != LAUNCH_MODE_SAME_WINDOW_TABS:
             same_window_post_join_view = SAME_WINDOW_VIEW_NONE
+
+        execution_speed_profile = EXECUTION_SPEED_LABEL_TO_VALUE.get(
+            self._execution_speed_label.get().strip(),
+            EXECUTION_SPEED_FAST,
+        )
+        if execution_speed_profile == EXECUTION_SPEED_FAST:
+            launch_delay_seconds = 0.05
+            element_retry_attempts = 1
+            element_retry_wait_seconds = 0.15
+            selector_lookup_timeout_seconds = 0.28
+        elif execution_speed_profile == EXECUTION_SPEED_BALANCED:
+            launch_delay_seconds = 0.2
+            element_retry_attempts = 2
+            element_retry_wait_seconds = 0.45
+            selector_lookup_timeout_seconds = 0.6
+        else:
+            launch_delay_seconds = 0.8
+            element_retry_attempts = 5
+            element_retry_wait_seconds = 2.0
+            selector_lookup_timeout_seconds = 1.2
+
         media_prompt_action = MEDIA_PROMPT_LABEL_TO_VALUE.get(
             self._media_prompt_label.get(),
             MEDIA_PROMPT_ACTION_CONTINUE,
@@ -1182,7 +1322,12 @@ class MultiMeetJoinerApp(tk.Tk):
             keep_mic_off=self._keep_mic_off.get(),
             auto_join=self._auto_join.get(),
             mute_participant_sound=self._mute_participant_sound.get(),
+            execution_speed_profile=execution_speed_profile,
             media_prompt_action=media_prompt_action,
+            launch_delay_seconds=launch_delay_seconds,
+            element_retry_attempts=element_retry_attempts,
+            element_retry_wait_seconds=element_retry_wait_seconds,
+            selector_lookup_timeout_seconds=selector_lookup_timeout_seconds,
         )
 
     def _set_running_state(self, running: bool) -> None:
