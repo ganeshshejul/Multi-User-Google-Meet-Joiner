@@ -81,19 +81,36 @@ python main.py
 	 `https://meet.google.com/abc-defg-hij`
 2. Enter `Number of Users`
 3. Add names (one per line) in `Names List`
+   - Validation rule: number of non-empty name lines must exactly equal `Number of Users`
 4. Choose options:
+	 - `Launch Mode`:
+	   - `Different incognito windows`
+	   - `Same window (incognito tabs)`
+	   - `After Join (Same Window)`:
+	     - `No change`
+	     - `Expanded window`
+	     - `Full screen`
 	 - `Keep Camera OFF`
 	 - `Keep Mic OFF`
 	 - `Auto Join`
+	 - `Mute Participant Sound After Join`
+	 - `Pre-Join Popup Action`:
+	   - `Continue without microphone and camera`
+	   - `Use microphone and camera`
+	   - `Manual (do not handle popup)`
 5. Click `Start Joining`
 6. Use `Stop` any time to cancel and close all open sessions
 
 ## Functional Behavior
 
-- If names are fewer than user count, additional names are auto-generated.
-- Name duplicates are automatically made unique (`Name`, `Name_2`, etc.).
-- Each participant launches in a separate Chrome incognito session.
+- Each participant launches in a Chrome incognito session.
+- `Names List` must contain exactly one line per participant (`Number of Users` must match line count).
+- Participants can launch in separate incognito windows or as tabs in one shared incognito window.
+- For same-window mode, you can choose post-join display mode (`No change`, `Expanded window`, `Full screen`).
 - Retry logic is used when key Meet elements are not found.
+- Pre-join media popup handling is configurable from the UI before launch.
+- In `Continue without microphone and camera` mode, the app skips extra device-toggle verification to reduce join delay.
+- Participant speaker output can be muted so admitted users stay silent.
 
 ## Important Notes and Risks
 
